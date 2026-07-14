@@ -1,8 +1,16 @@
 import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { theme, COLORS, Icon } from './theme';
+import { enablePushNotifications, isPushEnabled } from './pushNotifications';
 
-const SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzd8laiguQEggrKxQ509H3X-DRnbyCAdBpys3raAyzABj44SBDWc9bPe3YxpXb4igKdmQ/exec';
-const POLL_INTERVAL_MS = 6000;
+// Ganti ke alamat backend Express kamu (server.js).
+// Development: http://localhost:3001
+// Production : URL hasil deploy (Render/Railway/VPS/dst)
+// Diambil dari VITE_API_URL (sama seperti di App.jsx), bukan hardcode
+// localhost, supaya tetap jalan saat diakses dari luar localhost
+// (PC lain via IP server, mis. http://10.12.200.79:5173).
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const SHEET_API_URL = `${API_BASE}/monitoring-jadwal`;
+const POLL_INTERVAL_MS = 6000; // interval polling supaya perubahan di sheet ikut muncul di web
 
 const WEEK_OPTIONS = ['Minggu 1', 'Minggu 2', 'Minggu 3', 'Minggu 4', 'Minggu 5'];
 
@@ -104,7 +112,7 @@ const Avatar = ({ name = 'A', size = 40 }) => {
   const firstName = (name || 'A').split(/\n|,/)[0].trim();
   const initials = firstName.split(' ').map(w => w[0]).filter(Boolean).join('').slice(0, 2).toUpperCase() || 'A';
   return (
-    <div style={{ width: size, height: size, borderRadius: '50%', background: 'linear-gradient(135deg, #0082CA, #FFD700)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: size * 0.35, flexShrink: 0, boxShadow: '0 2px 10px rgba(0,0,0,0.15)' }}>
+    <div style={{ width: size, height: size, borderRadius: '50%', background: 'linear-gradient(135deg, #0082CA, #00A8E8)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#fff', fontWeight: 800, fontSize: size * 0.35, flexShrink: 0, boxShadow: '0 2px 10px rgba(0,0,0,0.15)' }}>
       {initials}
     </div>
   );
@@ -125,12 +133,12 @@ const TABS = [
   { key: 'addtask', label: 'Add Task', icon: 'add_circle' },
 ];
 
-export default function JadwalMonitoring() {
+export default function JadwalMonitoring({ initialTab, initialKegiatanId } = {}) {
   useResponsiveStyles();
 
   const apiReady = SHEET_API_URL && !SHEET_API_URL.includes('PASTE_YOUR');
 
-  const [tab, setTab] = useState('dashboard');
+  const [tab, setTab] = useState(initialTab || 'dashboard');
   const [team, setTeam] = useState([]);
   const [kegiatanList, setKegiatanList] = useState([]);
   const [selectedKegiatanId, setSelectedKegiatanId] = useState(null);
@@ -148,6 +156,20 @@ export default function JadwalMonitoring() {
   const [error, setError] = useState(null);
   const [lastSync, setLastSync] = useState(null);
   const pollRef = useRef(null);
+  const fetchDataRef = useRef(null);
+
+  // ── Push notification state ─────────────────────────────────────────────
+  const [pushEnabled, setPushEnabled] = useState(false);
+  useEffect(() => {
+    isPushEnabled().then(setPushEnabled);
+  }, []);
+  const handleEnablePush = async () => {
+    const ok = await enablePushNotifications();
+    if (ok) {
+      setPushEnabled(true);
+      alert('✅ Notifikasi diaktifkan! Kamu akan dapat pengingat kegiatan H-1 dan hari-H.');
+    }
+  };
 
   // ── Fetch data dari sheet bulan aktif ───────────────────────────────────
   const fetchData = useCallback(async (silent = false, overrideBulan = '') => {
@@ -170,6 +192,9 @@ export default function JadwalMonitoring() {
       if (!targetBulan && data.bulanAktif) setTargetBulan(data.bulanAktif);
       setLastSync(new Date());
       setSelectedKegiatanId(prev => {
+        if (initialKegiatanId && (data.kegiatan || []).some(k => String(k.id) === String(initialKegiatanId))) {
+          return initialKegiatanId;
+        }
         const stillExists = (data.kegiatan || []).some(k => String(k.id) === String(prev));
         return stillExists ? prev : (data.kegiatan?.[0]?.id ?? null);
       });
@@ -181,8 +206,15 @@ export default function JadwalMonitoring() {
   }, [apiReady, bulanAktif, targetBulan]);
 
   useEffect(() => {
+    // fetchDataRef selalu diupdate ke versi fetchData TERBARU (yang closure-nya
+    // sudah punya bulanAktif terkini), supaya polling di bawah tidak pernah
+    // memakai versi basi yang bisa "menimpa balik" ke bulan default server.
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  useEffect(() => {
     fetchData();
-    pollRef.current = setInterval(() => fetchData(true), POLL_INTERVAL_MS);
+    pollRef.current = setInterval(() => fetchDataRef.current(true), POLL_INTERVAL_MS);
     return () => clearInterval(pollRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -190,6 +222,7 @@ export default function JadwalMonitoring() {
   // Kalau bulan diganti, fetch ulang sheet yang bersangkutan
   const handleBulanChange = (newBulan) => {
     setBulanAktif(newBulan);
+    setTargetBulan(newBulan); // ikutkan "Tambah ke Bulan" di form Add Task, biar tidak nyangkut di bulan default awal
     setSelectedKegiatanId(null);
     fetchData(false, newBulan);
   };
@@ -218,7 +251,7 @@ export default function JadwalMonitoring() {
     try {
       const res = await fetch(SHEET_API_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
@@ -312,7 +345,7 @@ export default function JadwalMonitoring() {
       <div className="jdm-header">
         <div>
           <div style={{ fontSize: 11, fontWeight: 700, color: '#0082CA', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 4 }}>RESEARCH &amp; MONITORING</div>
-          <h1 className="jdm-page-title" style={{ fontSize: 22, fontWeight: 800, color: theme.text, margin: 0 }}>Monitoring Jadwal</h1>
+          <h1 className="jdm-page-title" style={{ fontSize: 22, fontWeight: 650, color: theme.text, margin: 0 }}>Monitoring Jadwal</h1>
           <p style={{ fontSize: 13, color: theme.textMuted, margin: '4px 0 0', fontWeight: 500 }}>
             Data tersinkron langsung dari Google Spreadsheet · Sheet: <strong style={{ color: '#0082CA' }}>{bulanAktif}</strong>
           </p>
@@ -327,6 +360,15 @@ export default function JadwalMonitoring() {
               {availableBulan.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
           </div>
+          {!pushEnabled ? (
+            <Btn variant="secondary" onClick={handleEnablePush}>
+              <Icon name="notifications" size={16} /> Aktifkan Notifikasi
+            </Btn>
+          ) : (
+            <span style={{ fontSize: 11, color: '#16a34a', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 4 }}>
+              <Icon name="notifications_active" size={14} /> Notifikasi Aktif
+            </span>
+          )}
           <SyncBadge />
         </div>
       </div>
@@ -451,7 +493,7 @@ export default function JadwalMonitoring() {
                 <thead>
                   <tr style={{ background: '#eff4ff' }}>
                     {['No', 'Kegiatan', 'Minggu ke', 'Tgl Mulai', 'Tgl Selesai', 'Jam Mulai', 'Jam Selesai', 'PIC', 'Tempat', 'Keterangan'].map(h => (
-                      <th key={h} style={{ padding: '10px 14px', fontSize: 10, fontWeight: 700, color: theme.textLabel, textTransform: 'uppercase', letterSpacing: '0.06em', textAlign: 'left', whiteSpace: 'nowrap' }}>{h}</th>
+                      <th key={h} style={{ padding: '10px 14px', fontSize: 10, fontWeight: 700, color: theme.textLabel, textTransform: 'uppercase', letterSpacing: '0.06em', textAlign: 'center', whiteSpace: 'nowrap' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
@@ -466,7 +508,7 @@ export default function JadwalMonitoring() {
                       onMouseEnter={e => e.currentTarget.style.background = theme.rowHover || '#f8faff'}
                       onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
                       <td style={{ padding: '11px 14px', fontWeight: 700, color: theme.textFaint }}>{k.no}</td>
-                      <td style={{ padding: '11px 14px', fontWeight: 600, color: '#0082CA', maxWidth: 260 }}>{k.nama}</td>
+                      <td style={{ padding: '11px 14px', fontWeight: 600, color: '#0082CA', maxWidth: 260, textAlign: 'inherit' }}>{k.nama}</td>
                       <td style={{ padding: '11px 14px', color: theme.textMuted, whiteSpace: 'nowrap' }}>{k.minggu || '-'}</td>
                       <td style={{ padding: '11px 14px', color: theme.text, whiteSpace: 'nowrap' }}>{k.tanggal_mulai || '-'}</td>
                       <td style={{ padding: '11px 14px', color: theme.text, whiteSpace: 'nowrap' }}>{k.tanggal_selesai || '-'}</td>
@@ -588,8 +630,8 @@ export default function JadwalMonitoring() {
       {tab === 'addtask' && (
         <div className="jdm-card-pad" style={{ ...card, padding: 28, width: '100%', boxSizing: 'border-box' }}>
           <div className="jdm-addtask-wrap">
-            <div style={{ fontSize: 11, fontWeight: 700, color: '#0082CA', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Input Data Monitoring / Jadwal</div>
-            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 4, marginBottom: 18 }}>Data akan langsung ditambahkan sebagai baris baru di sheet bulan yang dipilih.</div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: '#0082CA', textTransform: 'uppercase', letterSpacing: '0.08em', textAlign: 'center'}}>Input Data Monitoring / Jadwal</div>
+            <div style={{ fontSize: 12.5, color: theme.textMuted, marginTop: 4, marginBottom: 18, textAlign: 'center' }}>Data akan langsung ditambahkan sebagai baris baru di sheet bulan yang dipilih.</div>
 
             <div className="jdm-addtask-grid">
 
