@@ -30,19 +30,33 @@ router.get('/', async (req, res) => {
         let query;
         let params = [];
 
+        // Filter tahun sekarang TIDAK hanya mencocokkan kolom `tahun_anggaran`
+        // (yang cuma menyimpan 1 nilai tunggal), tapi juga memeriksa apakah
+        // tahun yang difilter berada di ANTARA tahun tanggal_mulai dan
+        // tanggal_selesai. Jadi proyek dengan rentang, misal, 2025-2026 akan
+        // ikut muncul saat user memfilter "2025" MAUPUN "2026" — bukan cuma
+        // di satu tahun yang kebetulan dipilih waktu input form.
+        const filterTahunClause = `(
+            tahun_anggaran = ?
+            OR (
+                tanggal_mulai IS NOT NULL AND tanggal_selesai IS NOT NULL
+                AND YEAR(tanggal_mulai) <= ? AND YEAR(tanggal_selesai) >= ?
+            )
+        )`;
+
         if (role === 'admin') {
             query = `SELECT * FROM penelitian`;
             if (tahun) {
-                query += ` WHERE tahun_anggaran = ?`;
-                params = [tahun];
+                query += ` WHERE ${filterTahunClause}`;
+                params = [tahun, tahun, tahun];
             }
             query += ` ORDER BY id DESC`;
         } else if (user_id) {
             query = `SELECT * FROM penelitian WHERE user_id = ?`;
             params = [user_id];
             if (tahun) {
-                query += ` AND tahun_anggaran = ?`;
-                params.push(tahun);
+                query += ` AND ${filterTahunClause}`;
+                params.push(tahun, tahun, tahun);
             }
             query += ` ORDER BY id DESC`;
         } else {
@@ -131,8 +145,8 @@ router.post('/', async (req, res) => {
                 if (!k.nama_kegiatan) continue;
                 await connection.query(
                     `INSERT INTO kegiatan
-                        (penelitian_id, nama_kegiatan, bobot, progress, tanggal_mulai, tanggal_selesai)
-                    VALUES (?, ?, ?, ?, ?, ?)`,
+                        (penelitian_id, nama_kegiatan, bobot, progress, tanggal_mulai, tanggal_selesai, total_anggaran, realisasi_anggaran)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                         penelitian_id,
                         k.nama_kegiatan,
@@ -140,28 +154,45 @@ router.post('/', async (req, res) => {
                         k.progress || 0,
                         k.tanggal_mulai || null,
                         k.tanggal_selesai || null,
+                        k.total_anggaran || 0,        // per kegiatan, dikirim dari frontend
+                        k.realisasi_anggaran || 0,    // per kegiatan, dikirim dari frontend
                     ]
                 );
             }
         }
 
         // Simpan rincian RAB sebagai transaksi cashflow awal
-        if (Array.isArray(rincian_rab) && rincian_rab.length > 0) {
-            for (const r of rincian_rab) {
-                if (!r.uraian) continue;
+        // Simpan rincian kegiatan (dipakai untuk Kurva S / progress per-langkah)
+        if (Array.isArray(kegiatan) && kegiatan.length > 0) {
+            for (const k of kegiatan) {
+                if (!k.nama_kegiatan) continue;
                 await connection.query(
-                    `INSERT INTO cashflow
-                        (penelitian_id, tanggal, uraian, jenis_belanja, nominal)
-                    VALUES (?, ?, ?, ?, ?)`,
+                    `INSERT INTO kegiatan
+                        (penelitian_id, nama_kegiatan, bobot, progress, tanggal_mulai, tanggal_selesai, total_anggaran, realisasi_anggaran)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
                     [
                         penelitian_id,
-                        formatTanggalToStr(r.tanggal),
-                        r.uraian,
-                        r.jenis_belanja || 'Alat',
-                        r.nominal || 0,
+                        k.nama_kegiatan,
+                        k.bobot || 0,
+                        k.progress || 0,
+                        k.tanggal_mulai || null,
+                        k.tanggal_selesai || null,
+                        k.total_anggaran || 0,
+                        k.realisasi_anggaran || 0,
                     ]
                 );
             }
+
+            // total_anggaran penelitian = SUM dari total_anggaran semua kegiatan,
+            // supaya konsisten dengan cara recalculate di server.js (bukan nilai statis form)
+            const totalAnggaranSum = kegiatan.reduce(
+                (sum, k) => sum + (Number(k.total_anggaran) || 0),
+                0
+            );
+            await connection.query(
+                `UPDATE penelitian SET total_anggaran = ? WHERE id = ?`,
+                [totalAnggaranSum, penelitian_id]
+            );
         }
 
         await connection.commit();
@@ -222,20 +253,35 @@ router.put('/:id', async (req, res) => {
     }
 });
 
-// DELETE penelitian
+// DELETE penelitian beserta seluruh data anak (kegiatan, cashflow, realisasi_rab)
+// Dilakukan dalam transaksi supaya tidak ada data "yatim" kalau salah satu
+// langkah gagal di tengah jalan.
 router.delete('/:id', async (req, res) => {
+    const { id } = req.params;
+    const connection = await pool.getConnection();
     try {
-        const { id } = req.params;
-        const [result] = await pool.query('DELETE FROM penelitian WHERE id = ?', [id]);
+        await connection.beginTransaction();
+
+        // Hapus data anak dulu (urutan penting kalau ada foreign key constraint)
+        await connection.query('DELETE FROM realisasi_rab WHERE penelitian_id = ?', [id]);
+        await connection.query('DELETE FROM cashflow WHERE penelitian_id = ?', [id]);
+        await connection.query('DELETE FROM kegiatan WHERE penelitian_id = ?', [id]);
+
+        const [result] = await connection.query('DELETE FROM penelitian WHERE id = ?', [id]);
 
         if (result.affectedRows === 0) {
+            await connection.rollback();
             return res.status(404).json({ error: 'Penelitian tidak ditemukan' });
         }
 
-        res.json({ message: 'Berhasil dihapus' });
+        await connection.commit();
+        res.json({ message: 'Penelitian beserta seluruh data terkait berhasil dihapus' });
     } catch (err) {
+        await connection.rollback();
         console.error('Gagal menghapus penelitian:', err.message);
         res.status(500).json({ error: 'Gagal menghapus data penelitian' });
+    } finally {
+        connection.release();
     }
 });
 
